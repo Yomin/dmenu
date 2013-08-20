@@ -5,6 +5,10 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#include <errno.h>
+#include <dirent.h>
+#include <sys/queue.h>
+#include <sys/stat.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
@@ -13,10 +17,14 @@
 #endif
 #include "draw.h"
 
-#define INTERSECT(x,y,w,h,r)  (MAX(0, MIN((x)+(w),(r).x_org+(r).width)  - MAX((x),(r).x_org)) \
-                             * MAX(0, MIN((y)+(h),(r).y_org+(r).height) - MAX((y),(r).y_org)))
-#define MIN(a,b)              ((a) < (b) ? (a) : (b))
-#define MAX(a,b)              ((a) > (b) ? (a) : (b))
+#define INTERSECT(x,y,w,h,r) (MAX(0, MIN((x)+(w),(r).x_org+(r).width)  - MAX((x),(r).x_org)) \
+							* MAX(0, MIN((y)+(h),(r).y_org+(r).height) - MAX((y),(r).y_org)))
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
+
+#ifndef PATH_MAX
+#define PATH_MAX 256
+#endif
 
 typedef struct Item Item;
 struct Item {
@@ -24,24 +32,39 @@ struct Item {
 	Item *left, *right;
 };
 
+typedef struct Elem Elem;
+struct Elem {
+	LIST_ENTRY(Elem) chain;
+	char text[BUFSIZ], path[PATH_MAX];
+	int width, maxwidth;
+	Bool dir;
+};
+typedef struct ElemList ElemList;
+LIST_HEAD(ElemList, Elem);
+
 static void appenditem(Item *item, Item **list, Item **last);
 static void calcoffsets(void);
 static char *cistrstr(const char *s, const char *sub);
 static void drawmenu(void);
 static void grabkeyboard(void);
-static void insert(const char *str, ssize_t n);
+static void insert(const char *str, ssize_t n, Bool domatch);
 static void keypress(XKeyEvent *ev);
 static void match(void);
 static size_t nextrune(int inc);
 static void paste(void);
 static void readstdin(void);
+static void listdir(void);
 static void run(void);
 static void setup(void);
 static void usage(void);
 
-static char text[BUFSIZ] = "";
+static ElemList elemlist;
+static Elem *elem;
+static char pwd[PATH_MAX], cwd[PATH_MAX] = "";
 static int bh, mw, mh;
-static int inputw, promptw;
+static int promptw, inputw;
+static int fsize = 0, cwdlen = 0;
+static Bool exactmatch;
 static size_t cursor = 0;
 static const char *font = NULL;
 static const char *prompt = NULL;
@@ -53,11 +76,11 @@ static unsigned int lines = 0;
 static unsigned long normcol[ColLast];
 static unsigned long selcol[ColLast];
 static Atom clip, utf8;
-static Bool topbar = True;
+static Bool topbar = True, filecompletion = False;
 static DC *dc;
-static Item *items = NULL;
+static Item *items = NULL, *fitems = NULL;
 static Item *matches, *matchend;
-static Item *prev, *curr, *next, *sel;
+static Item *prev, *curr, *next, *sel, *tabsel = NULL;
 static Window win;
 static XIC xic;
 
@@ -72,7 +95,7 @@ main(int argc, char *argv[]) {
 	for(i = 1; i < argc; i++)
 		/* these options take no arguments */
 		if(!strcmp(argv[i], "-v")) {      /* prints version information */
-			puts("dmenu-"VERSION", © 2006-2012 dmenu engineers, see LICENSE for details");
+			puts("dmenu-"VERSION", © 2006-2012 dmenu engineers, 2013 yomin, see LICENSE for details");
 			exit(EXIT_SUCCESS);
 		}
 		else if(!strcmp(argv[i], "-b"))   /* appears at the bottom of the screen */
@@ -83,6 +106,8 @@ main(int argc, char *argv[]) {
 			fstrncmp = strncasecmp;
 			fstrstr = cistrstr;
 		}
+		else if(!strcmp(argv[i], "-fc"))  /* file completion */
+			filecompletion = True;
 		else if(i+1 == argc)
 			usage();
 		/* these options take one argument */
@@ -118,6 +143,18 @@ main(int argc, char *argv[]) {
 	run();
 
 	return 1; /* unreachable */
+}
+
+void cleanup(int status) {
+	if(items)
+		free(items);
+	if(fitems)
+		free(fitems);
+	while((elem = elemlist.lh_first)) {
+		LIST_REMOVE(elem, chain);
+		free(elem);
+	}
+	exit(status);
 }
 
 void
@@ -163,6 +200,7 @@ void
 drawmenu(void) {
 	int curpos;
 	Item *item;
+	Elem *e;
 
 	dc->x = 0;
 	dc->y = 0;
@@ -171,38 +209,59 @@ drawmenu(void) {
 
 	if(prompt) {
 		dc->w = promptw;
-		drawtext(dc, prompt, selcol);
+		drawtext(dc, prompt, True, selcol);
 		dc->x = dc->w;
 	}
+
+	/* draw finished front input elems */
+	e = elemlist.lh_first;
+	while(e && e != elem) {
+		dc->w = e->width;
+		drawtext(dc, e->text, False, normcol);
+		dc->x += dc->w;
+		if(e->dir)
+			dc->x -= 8;
+		e = e->chain.le_next;
+	}
+
 	/* draw input field */
-	dc->w = (lines > 0 || !matches) ? mw - dc->x : inputw;
-	drawtext(dc, text, normcol);
-	if((curpos = textnw(dc, text, cursor) + dc->h/2 - 2) < dc->w)
-		drawrect(dc, curpos, 2, 1, dc->h - 4, True, FG(dc, normcol));
+	dc->w = (lines > 0 || !matches) ? mw - dc->x : elem->maxwidth;
+	if((curpos = textnw(dc, elem->text, cursor)) < dc->w)
+		drawrect(dc, curpos+6, 0, 6, dc->h, True, BG(dc, selcol));
+	drawtext(dc, elem->text, False, normcol);
+	dc->x += dc->w;
+
+	/* draw finished rear input elems */
+	e = elem->chain.le_next;
+	while(e) {
+		dc->w = e->width;
+		drawtext(dc, e->text, True, normcol);
+		dc->x += dc->w;
+		e = e->chain.le_next;
+	}
 
 	if(lines > 0) {
 		/* draw vertical list */
 		dc->w = mw - dc->x;
 		for(item = curr; item != next; item = item->right) {
 			dc->y += dc->h;
-			drawtext(dc, item->text, (item == sel) ? selcol : normcol);
+			drawtext(dc, item->text, True, (item == sel) ? selcol : normcol);
 		}
 	}
 	else if(matches) {
 		/* draw horizontal list */
-		dc->x += inputw;
 		dc->w = textw(dc, "<");
 		if(curr->left)
-			drawtext(dc, "<", normcol);
+			drawtext(dc, "<", True, normcol);
 		for(item = curr; item != next; item = item->right) {
 			dc->x += dc->w;
 			dc->w = MIN(textw(dc, item->text), mw - dc->x - textw(dc, ">"));
-			drawtext(dc, item->text, (item == sel) ? selcol : normcol);
+			drawtext(dc, item->text, True, (item == sel) ? selcol : normcol);
 		}
 		dc->w = textw(dc, ">");
 		dc->x = mw - dc->w;
 		if(next)
-			drawtext(dc, ">", normcol);
+			drawtext(dc, ">", True, normcol);
 	}
 	mapdc(dc, win, mw, mh);
 }
@@ -214,7 +273,7 @@ grabkeyboard(void) {
 	/* try to grab keyboard, we may have to wait for another process to ungrab */
 	for(i = 0; i < 1000; i++) {
 		if(XGrabKeyboard(dc->dpy, DefaultRootWindow(dc->dpy), True,
-		                 GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess)
+				GrabModeSync, GrabModeAsync, CurrentTime) == GrabSuccess)
 			return;
 		usleep(1000);
 	}
@@ -222,15 +281,121 @@ grabkeyboard(void) {
 }
 
 void
-insert(const char *str, ssize_t n) {
-	if(strlen(text) + n > sizeof text - 1)
+insert(const char *str, ssize_t n, Bool domatch) {
+	if(strlen(elem->text) + n > BUFSIZ - 1)
 		return;
 	/* move existing text out of the way, insert new text, and update cursor */
-	memmove(&text[cursor + n], &text[cursor], sizeof text - cursor - MAX(n, 0));
+	memmove(&elem->text[cursor + n], &elem->text[cursor], BUFSIZ - cursor - MAX(n, 0));
 	if(n > 0)
-		memcpy(&text[cursor], str, n);
+		memcpy(&elem->text[cursor], str, n);
 	cursor += n;
+	if(domatch)
+		match();
+}
+
+int
+pfxcmp(const char *pfx, const char *str, int plen) {
+	int len = 0;
+	while(*pfx && *str && len < plen && *pfx == *str) {
+		len++;
+		pfx++;
+		str++;
+	}
+	return !len ? plen : len;
+}
+
+Bool isdir(const char *path, const char *name) {
+	char buf[PATH_MAX];
+	struct stat sbuf;
+	sprintf(buf, "%s/%s", path, name);
+	if(stat(buf, &sbuf) == -1)
+		return False;
+	return S_ISDIR(sbuf.st_mode);
+}
+
+void
+newelem() {
+	tabsel = NULL;
+
+	strcpy(elem->text, sel->text);
+	cursor = strlen(elem->text);
+	if(elem != elemlist.lh_first && isdir(elem->path, elem->text)) {
+		elem->dir = True;
+		strcpy(elem->text+cursor, "/");
+		cursor++;
+		if(*cwd) {
+			strcpy(cwd+cwdlen, elem->text);
+			cwdlen += strlen(elem->text);
+		}
+		else {
+			strcpy(cwd, elem->path);
+			cwdlen = strlen(elem->path);
+			strcpy(cwd+cwdlen, "/");
+			cwdlen++;
+			strcpy(cwd+cwdlen, elem->text);
+			cwdlen += strlen(elem->text);
+		}
+	}
+	else
+		*cwd = 0;
+	elem->width = textw(dc, elem->text) -6;
+	inputw += -elem->maxwidth + elem->width;
+
+	Elem *e = malloc(sizeof(Elem));
+	LIST_INSERT_AFTER(elem, e, chain);
+	memset(e->text, 0, BUFSIZ);
+	cursor = 0;
+	elem = e;
+
+	listdir();
+	inputw += elem->maxwidth;
 	match();
+}
+
+void
+insertselprefix() {
+	Item *i;
+	int len, plen;
+	char ctmp, *tok;
+
+	/* get prefix denominator of matches from current selection */
+	i = matches;
+	plen = strlen(sel->text);
+	while(i) {
+		if(i != sel)
+			plen = pfxcmp(i->text, sel->text, plen);
+		i = i->right;
+	}
+	/* insert prefix into input */
+	cursor = 0;
+	ctmp = sel->text[plen];
+	sel->text[plen] = ' ';
+	insert(sel->text, plen+1, False);
+	sel->text[plen] = ctmp;
+	cursor = plen;
+
+	/* filter rest of input for substrings of prefix */
+	len = strlen(elem->text);
+	elem->text[cursor] = 0;
+	tok = strtok(elem->text+cursor+1, " ");
+	while(tok) {
+		if(strstr(elem->text, tok)) {
+			plen = strlen(tok);
+			memcpy(tok, tok+plen+1, len - (tok-elem->text) - plen);
+			len -= plen+1;
+			plen = strlen(elem->text);
+			if(len == plen)
+				break;
+			tok = strtok(tok, " ");
+		}
+		else {
+			tok = strtok(0, " ");
+			if(tok)
+				tok[-1] = ' ';
+		}
+	}
+	if(len > plen)
+		elem->text[cursor] = ' ';
 }
 
 void
@@ -259,21 +424,21 @@ keypress(XKeyEvent *ev) {
 		case XK_p: ksym = XK_Up;        break;
 
 		case XK_k: /* delete right */
-			text[cursor] = '\0';
+			elem->text[cursor] = '\0';
 			match();
 			break;
 		case XK_u: /* delete left */
-			insert(NULL, 0 - cursor);
+			insert(NULL, 0 - cursor, True);
 			break;
 		case XK_w: /* delete word */
-			while(cursor > 0 && text[nextrune(-1)] == ' ')
-				insert(NULL, nextrune(-1) - cursor);
-			while(cursor > 0 && text[nextrune(-1)] != ' ')
-				insert(NULL, nextrune(-1) - cursor);
+			while(cursor > 0 && elem->text[nextrune(-1)] == ' ')
+				insert(NULL, nextrune(-1) - cursor, True);
+			while(cursor > 0 && elem->text[nextrune(-1)] != ' ')
+				insert(NULL, nextrune(-1) - cursor, True);
 			break;
 		case XK_y: /* paste selection */
 			XConvertSelection(dc->dpy, (ev->state & ShiftMask) ? clip : XA_PRIMARY,
-			                  utf8, utf8, win, CurrentTime);
+				utf8, utf8, win, CurrentTime);
 			return;
 		default:
 			return;
@@ -291,22 +456,24 @@ keypress(XKeyEvent *ev) {
 		}
 	switch(ksym) {
 	default:
-		if(!iscntrl(*buf))
-			insert(buf, len);
+		if(!iscntrl(*buf)) {
+			tabsel = NULL;
+			insert(buf, len, True);
+		}
 		break;
 	case XK_Delete:
-		if(text[cursor] == '\0')
+		if(elem->text[cursor] == '\0')
 			return;
 		cursor = nextrune(+1);
 		/* fallthrough */
 	case XK_BackSpace:
 		if(cursor == 0)
 			return;
-		insert(NULL, nextrune(-1) - cursor);
+		insert(NULL, nextrune(-1) - cursor, True);
 		break;
 	case XK_End:
-		if(text[cursor] != '\0') {
-			cursor = strlen(text);
+		if(elem->text[cursor] != '\0') {
+			cursor = strlen(elem->text);
 			break;
 		}
 		if(next) {
@@ -321,7 +488,7 @@ keypress(XKeyEvent *ev) {
 		sel = matchend;
 		break;
 	case XK_Escape:
-		exit(EXIT_FAILURE);
+		cleanup(EXIT_FAILURE);
 	case XK_Home:
 		if(sel == matches) {
 			cursor = 0;
@@ -358,10 +525,28 @@ keypress(XKeyEvent *ev) {
 		break;
 	case XK_Return:
 	case XK_KP_Enter:
-		puts((sel && !(ev->state & ShiftMask)) ? sel->text : text);
-		exit(EXIT_SUCCESS);
+		if(filecompletion) {
+			Elem *e = elemlist.lh_first;
+			Bool dir;
+			while(1) {
+				if(e == elem && sel && !(ev->state & ShiftMask))
+					printf("%s", sel->text);
+				else
+					printf("%s", e->text);
+				dir = e->dir;
+				e = e->chain.le_next;
+				if(e && *e->text)
+					printf("%s", dir ? "" : " ");
+				else
+					break;
+			}
+			puts("");
+		}
+		else
+			puts(sel && !(ev->state & ShiftMask) ? sel->text : elem->text);
+		cleanup(EXIT_SUCCESS);
 	case XK_Right:
-		if(text[cursor] != '\0') {
+		if(elem->text[cursor] != '\0') {
 			cursor = nextrune(+1);
 			break;
 		}
@@ -377,9 +562,22 @@ keypress(XKeyEvent *ev) {
 	case XK_Tab:
 		if(!sel)
 			return;
-		strncpy(text, sel->text, sizeof text);
-		cursor = strlen(text);
+		if(!filecompletion) {
+			strcpy(elem->text, sel->text);
+			cursor = strlen(elem->text);
+			match();
+			break;
+		}
+		if(sel == tabsel || matches == matchend || exactmatch) {
+			newelem();
+			break;
+		}
+
+		tabsel = sel;
+		insertselprefix();
 		match();
+		if(matches == matchend)
+			newelem();
 		break;
 	}
 	drawmenu();
@@ -390,12 +588,16 @@ match(void) {
 	static char **tokv = NULL;
 	static int tokn = 0;
 
-	char buf[sizeof text], *s;
+	char buf[BUFSIZ], *s;
 	int i, tokc = 0;
 	size_t len;
-	Item *item, *lprefix, *lsubstr, *prefixend, *substrend;
+	Item *item, *lprefix, *lsubstr, *prefixend, *substrend, *citems;
 
-	strcpy(buf, text);
+	citems = items;
+	if(elem != elemlist.lh_first)
+		citems = fitems;
+
+	strcpy(buf, elem->text);
 	/* separate input text into tokens to be matched individually */
 	for(s = strtok(buf, " "); s; tokv[tokc-1] = s, s = strtok(NULL, " "))
 		if(++tokc > tokn && !(tokv = realloc(tokv, ++tokn * sizeof *tokv)))
@@ -403,15 +605,24 @@ match(void) {
 	len = tokc ? strlen(tokv[0]) : 0;
 
 	matches = lprefix = lsubstr = matchend = prefixend = substrend = NULL;
-	for(item = items; item && item->text; item++) {
+	exactmatch = False;
+
+	if(tabsel)
+		appenditem(tabsel, &matches, &matchend);
+
+	for(item = citems; item && item->text; item++) {
+		if(tabsel == item)
+			continue;
 		for(i = 0; i < tokc; i++)
 			if(!fstrstr(item->text, tokv[i]))
 				break;
 		if(i != tokc) /* not all tokens match */
 			continue;
 		/* exact matches go first, then prefixes, then substrings */
-		if(!tokc || !fstrncmp(tokv[0], item->text, len+1))
+		if(!tokc || !fstrncmp(tokv[0], item->text, len+1)) {
+			exactmatch = True;
 			appenditem(item, &matches, &matchend);
+		}
 		else if(!fstrncmp(tokv[0], item->text, len))
 			appenditem(item, &lprefix, &prefixend);
 		else
@@ -444,7 +655,7 @@ nextrune(int inc) {
 	ssize_t n;
 
 	/* return location of next utf8 rune in the given direction (+1 or -1) */
-	for(n = cursor + inc; n + inc >= 0 && (text[n] & 0xc0) == 0x80; n += inc);
+	for(n = cursor + inc; n + inc >= 0 && (elem->text[n] & 0xc0) == 0x80; n += inc);
 	return n;
 }
 
@@ -456,16 +667,16 @@ paste(void) {
 	Atom da;
 
 	/* we have been given the current selection, now insert it into input */
-	XGetWindowProperty(dc->dpy, win, utf8, 0, (sizeof text / 4) + 1, False,
+	XGetWindowProperty(dc->dpy, win, utf8, 0, (BUFSIZ / 4) + 1, False,
 	                   utf8, &da, &di, &dl, &dl, (unsigned char **)&p);
-	insert(p, (q = strchr(p, '\n')) ? q-p : (ssize_t)strlen(p));
+	insert(p, (q = strchr(p, '\n')) ? q-p : (ssize_t)strlen(p), True);
 	XFree(p);
 	drawmenu();
 }
 
 void
 readstdin(void) {
-	char buf[sizeof text], *p, *maxstr = NULL;
+	char buf[BUFSIZ], *p, *maxstr = NULL;
 	size_t i, max = 0, size = 0;
 
 	/* read each line from stdin and add it to the item list */
@@ -484,6 +695,44 @@ readstdin(void) {
 		items[i].text = NULL;
 	inputw = maxstr ? textw(dc, maxstr) : 0;
 	lines = MIN(lines, i);
+}
+
+void
+listdir(void) {
+	size_t i, max = 0;
+	DIR *dp;
+	struct dirent *ep;
+	char *maxstr = NULL;
+
+	if(*cwd)
+		dp = opendir(cwd);
+	else
+		dp = opendir(pwd);
+	if(!dp)
+		switch(errno) {
+			case EACCES: eprintf("file: permission denied"); break;
+			case ENOENT: eprintf("file: pwd unlinked"); break;
+			case ENOTDIR: eprintf("file: pwd not directory"); break;
+		}
+
+	for(i = 0; (ep = readdir(dp)); i++) {
+		if(i+1 >= fsize / sizeof *fitems)
+			if(!(fitems = realloc(fitems, (fsize += BUFSIZ))))
+				eprintf("cannot realloc %u bytes:", fsize);
+		if(!(fitems[i].text = strdup(ep->d_name)))
+			eprintf("cannot strdup %u bytes:", strlen(ep->d_name)+1);
+		if(strlen(fitems[i].text) > max)
+			max = strlen(maxstr = fitems[i].text);
+	}
+	if(fitems)
+		fitems[i].text = NULL;
+
+	closedir(dp);
+	lines = MIN(lines, i);
+	elem->maxwidth = maxstr ? textw(dc, maxstr) +6 : 0;
+	elem->width = 0;
+	elem->dir = False;
+	strcpy(elem->path, pwd);
 }
 
 void
@@ -514,7 +763,7 @@ run(void) {
 }
 
 void
-setup(void) {
+setup() {
 	int x, y, screen = DefaultScreen(dc->dpy);
 	Window root = RootWindow(dc->dpy, screen);
 	XSetWindowAttributes swa;
@@ -529,8 +778,22 @@ setup(void) {
 	selcol[ColBG]  = getcolor(dc, selbgcolor);
 	selcol[ColFG]  = getcolor(dc, selfgcolor);
 
-	clip = XInternAtom(dc->dpy, "CLIPBOARD",   False);
+	clip = XInternAtom(dc->dpy, "CLIPBOARD", False);
 	utf8 = XInternAtom(dc->dpy, "UTF8_STRING", False);
+
+	LIST_INIT(&elemlist);
+	elem = malloc(sizeof(Elem));
+	LIST_INSERT_HEAD(&elemlist, elem, chain);
+	memset(elem->text, 0, BUFSIZ);
+	elem->dir = False;
+	elem->maxwidth = inputw;
+
+	if(filecompletion && !getcwd(pwd, PATH_MAX))
+		switch(errno) {
+			case EACCES: eprintf("file: permission denied"); break;
+			case ENOENT: eprintf("file: pwd unlinked"); break;
+			case ERANGE: eprintf("file: path too long"); break;
+		}
 
 	/* calculate menu geometry */
 	bh = dc->font.height + 2;
@@ -577,7 +840,7 @@ setup(void) {
 		mw = DisplayWidth(dc->dpy, screen);
 	}
 	promptw = prompt ? textw(dc, prompt) : 0;
-	inputw = MIN(inputw, mw/3);
+	elem->maxwidth = MIN(elem->maxwidth, mw/3);
 	match();
 
 	/* create menu window */
@@ -585,14 +848,14 @@ setup(void) {
 	swa.background_pixel = normcol[ColBG];
 	swa.event_mask = ExposureMask | KeyPressMask | VisibilityChangeMask;
 	win = XCreateWindow(dc->dpy, root, x, y, mw, mh, 0,
-	                    DefaultDepth(dc->dpy, screen), CopyFromParent,
-	                    DefaultVisual(dc->dpy, screen),
-	                    CWOverrideRedirect | CWBackPixel | CWEventMask, &swa);
+		DefaultDepth(dc->dpy, screen), CopyFromParent,
+		DefaultVisual(dc->dpy, screen),
+		CWOverrideRedirect | CWBackPixel | CWEventMask, &swa);
 
 	/* open input methods */
 	xim = XOpenIM(dc->dpy, NULL, NULL, NULL);
 	xic = XCreateIC(xim, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
-	                XNClientWindow, win, XNFocusWindow, win, NULL);
+		XNClientWindow, win, XNFocusWindow, win, NULL);
 
 	XMapRaised(dc->dpy, win);
 	resizedc(dc, mw, mh);
@@ -602,6 +865,6 @@ setup(void) {
 void
 usage(void) {
 	fputs("usage: dmenu [-b] [-f] [-i] [-l lines] [-p prompt] [-fn font]\n"
-	      "             [-nb color] [-nf color] [-sb color] [-sf color] [-v]\n", stderr);
+		  "             [-nb color] [-nf color] [-sb color] [-sf color] [-v] [-fc]\n", stderr);
 	exit(EXIT_FAILURE);
 }
