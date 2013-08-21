@@ -26,6 +26,10 @@
 #define PATH_MAX 256
 #endif
 
+#define DIR_NODIR 0
+#define DIR_ISDIR 1
+#define DIR_LAST  2
+
 typedef struct Item Item;
 struct Item {
 	char *text;
@@ -34,13 +38,13 @@ struct Item {
 
 typedef struct Elem Elem;
 struct Elem {
-	LIST_ENTRY(Elem) chain;
+	CIRCLEQ_ENTRY(Elem) chain;
 	char text[BUFSIZ], path[PATH_MAX];
 	int width, maxwidth;
-	Bool dir;
+	char dir;
 };
 typedef struct ElemList ElemList;
-LIST_HEAD(ElemList, Elem);
+CIRCLEQ_HEAD(ElemList, Elem);
 
 static void appenditem(Item *item, Item **list, Item **last);
 static void calcoffsets(void);
@@ -150,8 +154,9 @@ void cleanup(int status) {
 		free(items);
 	if(fitems)
 		free(fitems);
-	while((elem = elemlist.lh_first)) {
-		LIST_REMOVE(elem, chain);
+	while(elemlist.cqh_first != (void*)&elemlist) {
+	    elem = elemlist.cqh_first;
+		CIRCLEQ_REMOVE(&elemlist, elem, chain);
 		free(elem);
 	}
 	exit(status);
@@ -214,14 +219,14 @@ drawmenu(void) {
 	}
 
 	/* draw finished front input elems */
-	e = elemlist.lh_first;
+	e = elemlist.cqh_first;
 	while(e && e != elem) {
 		dc->w = e->width;
 		drawtext(dc, e->text, False, normcol);
 		dc->x += dc->w;
-		if(e->dir)
+		if(e->dir == DIR_ISDIR)
 			dc->x -= 8;
-		e = e->chain.le_next;
+		e = e->chain.cqe_next;
 	}
 
 	/* draw input field */
@@ -232,12 +237,12 @@ drawmenu(void) {
 	dc->x += dc->w;
 
 	/* draw finished rear input elems */
-	e = elem->chain.le_next;
-	while(e) {
+	e = elem->chain.cqe_next;
+	while(e != (void*)&elemlist) {
 		dc->w = e->width;
 		drawtext(dc, e->text, True, normcol);
 		dc->x += dc->w;
-		e = e->chain.le_next;
+		e = e->chain.cqe_next;
 	}
 
 	if(lines > 0) {
@@ -319,8 +324,8 @@ newelem() {
 
 	strcpy(elem->text, sel->text);
 	cursor = strlen(elem->text);
-	if(elem != elemlist.lh_first && isdir(elem->path, elem->text)) {
-		elem->dir = True;
+	if(elem != elemlist.cqh_first && isdir(elem->path, elem->text)) {
+		elem->dir = DIR_ISDIR;
 		strcpy(elem->text+cursor, "/");
 		cursor++;
 		if(*cwd) {
@@ -340,7 +345,7 @@ newelem() {
 	inputw += -elem->maxwidth + elem->width;
 
 	Elem *e = malloc(sizeof(Elem));
-	LIST_INSERT_AFTER(elem, e, chain);
+	CIRCLEQ_INSERT_AFTER(&elemlist, elem, e, chain);
 	memset(e->text, 0, BUFSIZ);
 	cursor = 0;
 	elem = e;
@@ -398,10 +403,11 @@ insertselprefix() {
 
 void
 keypress(XKeyEvent *ev) {
-	char buf[32];
+	char buf[32], *chr;
 	int len;
 	KeySym ksym = NoSymbol;
 	Status status;
+	Elem *e;
 
 	len = XmbLookupString(xic, ev, buf, sizeof buf, &ksym, &status);
 	if(status == XBufferOverflow)
@@ -459,15 +465,63 @@ keypress(XKeyEvent *ev) {
 			insert(buf, len, True);
 		}
 		break;
+	case ' ':
+		if(!*elem->text && elem != elemlist.cqh_first && elem->chain.cqe_prev->dir == DIR_ISDIR) {
+			elem->chain.cqe_prev->dir = DIR_LAST;
+			*cwd = 0;
+			listdir();
+			inputw += elem->maxwidth;
+			match();
+		}
+		else {
+			tabsel = NULL;
+			insert(" ", 1, True);
+		}
+		break;
 	case XK_Delete:
 		if(elem->text[cursor] == '\0')
 			return;
 		cursor = nextrune(+1);
 		/* fallthrough */
 	case XK_BackSpace:
-		if(cursor == 0)
-			return;
-		insert(NULL, nextrune(-1) - cursor, True);
+		if(cursor == 0) {
+			if(elem == elemlist.cqh_first)
+				return;
+			e = elem->chain.cqe_prev;
+			inputw -= elem->maxwidth + e->width;
+			cursor = strlen(e->text);
+
+			switch(e->dir) {
+				case DIR_NODIR:
+					*cwd = 0;
+					break;
+				case DIR_ISDIR:
+					e->text[--cursor] = 0;
+					e->dir = DIR_NODIR;
+					cwd[cwdlen-1] = 0;
+					chr = strrchr(cwd, '/');
+					chr[1] = 0;
+					cwdlen = chr-cwd+1;
+					break;
+				case DIR_LAST:
+					e->text[--cursor] = 0;
+					e->dir = DIR_NODIR;
+					strcpy(cwd, e->path);
+					cwdlen = strlen(cwd);
+					break;
+			}
+
+			CIRCLEQ_REMOVE(&elemlist, elem, chain);
+			elem = e;
+
+			if(elem != elemlist.cqh_first)
+				listdir();
+			inputw += elem->maxwidth;
+			match();
+		}
+		else
+			insert(NULL, nextrune(-1) - cursor, True);
+		tabsel = NULL;
 		break;
 	case XK_End:
 		if(elem->text[cursor] != '\0') {
@@ -524,17 +578,17 @@ keypress(XKeyEvent *ev) {
 	case XK_Return:
 	case XK_KP_Enter:
 		if(filecompletion) {
-			Elem *e = elemlist.lh_first;
-			Bool dir;
+			Elem *e = elemlist.cqh_first;
+			char dir;
 			while(1) {
 				if(e == elem && sel && !(ev->state & ShiftMask))
 					printf("%s", sel->text);
 				else
 					printf("%s", e->text);
 				dir = e->dir;
-				e = e->chain.le_next;
-				if(e && *e->text)
-					printf("%s", dir ? "" : " ");
+				e = e->chain.cqe_next;
+				if(e != (void*)&elemlist && *e->text)
+					printf("%s", dir==DIR_ISDIR ? "" : " ");
 				else
 					break;
 			}
@@ -592,7 +646,7 @@ match(void) {
 	Item *item, *lprefix, *lsubstr, *prefixend, *substrend, *citems;
 
 	citems = items;
-	if(elem != elemlist.lh_first)
+	if(elem != elemlist.cqh_first)
 		citems = fitems;
 
 	strcpy(buf, elem->text);
@@ -729,7 +783,7 @@ listdir(void) {
 	lines = MIN(lines, i);
 	elem->maxwidth = maxstr ? textw(dc, maxstr) +6 : 0;
 	elem->width = 0;
-	elem->dir = False;
+	elem->dir = DIR_NODIR;
 	strcpy(elem->path, *cwd ? cwd : pwd);
 }
 
@@ -779,11 +833,11 @@ setup() {
 	clip = XInternAtom(dc->dpy, "CLIPBOARD", False);
 	utf8 = XInternAtom(dc->dpy, "UTF8_STRING", False);
 
-	LIST_INIT(&elemlist);
+	CIRCLEQ_INIT(&elemlist);
 	elem = malloc(sizeof(Elem));
-	LIST_INSERT_HEAD(&elemlist, elem, chain);
+	CIRCLEQ_INSERT_HEAD(&elemlist, elem, chain);
 	memset(elem->text, 0, BUFSIZ);
-	elem->dir = False;
+	elem->dir = DIR_NODIR;
 	elem->maxwidth = inputw;
 
 	if(filecompletion) {
