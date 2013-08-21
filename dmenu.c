@@ -307,7 +307,7 @@ pfxcmp(const char *pfx, const char *str, int plen) {
 Bool isdir(const char *path, const char *name) {
 	char buf[PATH_MAX];
 	struct stat sbuf;
-	sprintf(buf, "%s/%s", path, name);
+	sprintf(buf, "%s%s", path, name);
 	if(stat(buf, &sbuf) == -1)
 		return False;
 	return S_ISDIR(sbuf.st_mode);
@@ -330,8 +330,6 @@ newelem() {
 		else {
 			strcpy(cwd, elem->path);
 			cwdlen = strlen(elem->path);
-			strcpy(cwd+cwdlen, "/");
-			cwdlen++;
 			strcpy(cwd+cwdlen, elem->text);
 			cwdlen += strlen(elem->text);
 		}
@@ -732,7 +730,7 @@ listdir(void) {
 	elem->maxwidth = maxstr ? textw(dc, maxstr) +6 : 0;
 	elem->width = 0;
 	elem->dir = False;
-	strcpy(elem->path, pwd);
+	strcpy(elem->path, *cwd ? cwd : pwd);
 }
 
 void
@@ -788,12 +786,15 @@ setup() {
 	elem->dir = False;
 	elem->maxwidth = inputw;
 
-	if(filecompletion && !getcwd(pwd, PATH_MAX))
-		switch(errno) {
-			case EACCES: eprintf("file: permission denied"); break;
-			case ENOENT: eprintf("file: pwd unlinked"); break;
-			case ERANGE: eprintf("file: path too long"); break;
-		}
+	if(filecompletion) {
+		if(!getcwd(pwd, PATH_MAX))
+			switch(errno) {
+				case EACCES: eprintf("file: permission denied"); break;
+				case ENOENT: eprintf("file: pwd unlinked"); break;
+				case ERANGE: eprintf("file: path too long"); break;
+			}
+		pwd[strlen(pwd)] = '/';
+	}
 
 	/* calculate menu geometry */
 	bh = dc->font.height + 2;
