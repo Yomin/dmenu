@@ -57,7 +57,7 @@ static void match(void);
 static size_t nextrune(int inc);
 static void paste(void);
 static void readstdin(void);
-static void listdir(void);
+static int listdir(void);
 static void run(void);
 static void setup(void);
 static void usage(void);
@@ -230,7 +230,10 @@ drawmenu(void) {
 	}
 
 	/* draw input field */
-	dc->w = (lines > 0 || !matches) ? mw - dc->x : elem->maxwidth;
+    if(elem->chain.cqe_next == (void*)&elemlist)
+        dc->w = lines > 0 || !matches ? mw - dc->x : elem->maxwidth;
+    else
+        dc->w = elem->width;
 	if((curpos = textnw(dc, elem->text, cursor)) < dc->w)
 		drawrect(dc, curpos+6, 0, 6, dc->h, True, BG(dc, selcol));
 	drawtext(dc, elem->text, False, normcol);
@@ -240,10 +243,15 @@ drawmenu(void) {
 	e = elem->chain.cqe_next;
 	while(e != (void*)&elemlist) {
 		dc->w = e->width;
-		drawtext(dc, e->text, True, normcol);
+		drawtext(dc, e->text, False, normcol);
 		dc->x += dc->w;
+        if(e->dir == DIR_ISDIR)
+			dc->x -= 8;
 		e = e->chain.cqe_next;
 	}
+
+	if(elem->chain.cqe_next != (void*)&elemlist)
+		dc->x += (lines > 0 || !matches) ? 0 : elem->maxwidth-elem->width;
 
 	if(lines > 0) {
 		/* draw vertical list */
@@ -294,8 +302,10 @@ insert(const char *str, ssize_t n, Bool domatch) {
 	if(n > 0)
 		memcpy(&elem->text[cursor], str, n);
 	cursor += n;
-	if(domatch)
+	if(domatch) {
+		elem->width = textw(dc, elem->text) -6;
 		match();
+	}
 }
 
 int
@@ -323,11 +333,9 @@ newelem() {
 	tabsel = NULL;
 
 	strcpy(elem->text, sel->text);
-	cursor = strlen(elem->text);
 	if(elem != elemlist.cqh_first && isdir(elem->path, elem->text)) {
 		elem->dir = DIR_ISDIR;
-		strcpy(elem->text+cursor, "/");
-		cursor++;
+		strcpy(elem->text+strlen(elem->text), "/");
 		if(*cwd) {
 			strcpy(cwd+cwdlen, elem->text);
 			cwdlen += strlen(elem->text);
@@ -349,8 +357,13 @@ newelem() {
 	memset(e->text, 0, BUFSIZ);
 	cursor = 0;
 	elem = e;
+	e = elem->chain.cqe_prev;
 
-	listdir();
+	if(listdir() && e->dir == DIR_ISDIR) {
+		e->dir = DIR_NODIR;
+		e->text[--cursor] = 0;
+		*cwd = 0;
+	}
 	inputw += elem->maxwidth;
 	match();
 }
@@ -399,6 +412,9 @@ insertselprefix() {
 	}
 	if(len > plen)
 		elem->text[cursor] = ' ';
+
+	elem->width = textw(dc, elem->text) -6;
+
 }
 
 void
@@ -487,7 +503,7 @@ keypress(XKeyEvent *ev) {
 		if(cursor == 0) {
 			if(elem == elemlist.cqh_first)
 				return;
-			e = elem->chain.cqe_prev;
+backspace:	e = elem->chain.cqe_prev;
 			inputw -= elem->maxwidth + e->width;
 			cursor = strlen(e->text);
 
@@ -550,9 +566,33 @@ keypress(XKeyEvent *ev) {
 		calcoffsets();
 		break;
 	case XK_Left:
-		if(cursor > 0 && (!sel || !sel->left || lines > 0)) {
-			cursor = nextrune(-1);
-			break;
+		if(cursor > 0) {
+			if(!sel || !sel->left || lines > 0) {
+				cursor = nextrune(-1);
+				break;
+			}
+		}
+		else if(!strlen(elem->text) && elem != elemlist.cqh_first->chain.cqe_prev)
+			goto backspace;
+		else if(elem != elemlist.cqh_first && !sel->left) {
+			e = elem->chain.cqe_prev;
+			while(e->dir == DIR_ISDIR)
+				e = e->chain.cqe_prev;
+			elem->width = textw(dc, elem->text) -6;
+			inputw += -elem->maxwidth + elem->width - e->width + e->maxwidth;
+			cursor = strlen(e->text);
+			if(e != elemlist.cqh_first) {
+				if(e->dir == DIR_LAST) {
+					e->text[--cursor] = 0;
+					e->dir = DIR_NODIR;
+				}
+				strcpy(cwd, e->path);
+				cwdlen = strlen(cwd);
+				listdir();
+			}
+			elem = e;
+			tabsel = NULL;
+			match();
 		}
 		if(lines > 0)
 			return;
@@ -579,18 +619,18 @@ keypress(XKeyEvent *ev) {
 	case XK_KP_Enter:
 		if(filecompletion) {
 			Elem *e = elemlist.cqh_first;
-			char dir;
-			while(1) {
+			while(e != (void*)&elemlist) {
+				if(!*e->text) {
+					e = e->chain.cqe_next;
+					continue;
+				}
 				if(e == elem && sel && !(ev->state & ShiftMask))
 					printf("%s", sel->text);
 				else
 					printf("%s", e->text);
-				dir = e->dir;
+				if(e->dir != DIR_ISDIR)
+					printf(" ");
 				e = e->chain.cqe_next;
-				if(e != (void*)&elemlist && *e->text)
-					printf("%s", dir==DIR_ISDIR ? "" : " ");
-				else
-					break;
 			}
 			puts("");
 		}
@@ -749,23 +789,27 @@ readstdin(void) {
 	lines = MIN(lines, i);
 }
 
-void
+int
 listdir(void) {
 	size_t i, max = 0;
 	DIR *dp;
 	struct dirent *ep;
 	char *maxstr = NULL;
+	char *path = *cwd ? cwd : pwd;
 
-	if(*cwd)
-		dp = opendir(cwd);
-	else
-		dp = opendir(pwd);
-	if(!dp)
+	dp = opendir(path);
+	if(!dp) {
 		switch(errno) {
-			case EACCES: eprintf("file: permission denied"); break;
-			case ENOENT: eprintf("file: pwd unlinked"); break;
-			case ENOTDIR: eprintf("file: pwd not directory"); break;
+			case EACCES: printf("file: permission denied: %s\n", path); break;
+			case ENOENT: printf("file: cwd unlinked: %s\n", path); break;
+			case ENOTDIR: printf("file: cwd not directory: %s\n", path); break;
 		}
+		if(fitems)
+			free(fitems);
+		fitems = 0;
+		fsize = 0;
+		return 1;
+	}
 
 	for(i = 0; (ep = readdir(dp)); i++) {
 		if(i+1 >= fsize / sizeof *fitems)
@@ -782,9 +826,11 @@ listdir(void) {
 	closedir(dp);
 	lines = MIN(lines, i);
 	elem->maxwidth = maxstr ? textw(dc, maxstr) +6 : 0;
-	elem->width = 0;
 	elem->dir = DIR_NODIR;
-	strcpy(elem->path, *cwd ? cwd : pwd);
+	elem->width = textw(dc, elem->text) -6;
+	strcpy(elem->path, path);
+
+	return 0;
 }
 
 void
@@ -843,9 +889,9 @@ setup() {
 	if(filecompletion) {
 		if(!getcwd(pwd, PATH_MAX))
 			switch(errno) {
-				case EACCES: eprintf("file: permission denied"); break;
-				case ENOENT: eprintf("file: pwd unlinked"); break;
-				case ERANGE: eprintf("file: path too long"); break;
+				case EACCES: printf("file: permission denied\n"); break;
+				case ENOENT: printf("file: pwd unlinked\n"); break;
+				case ERANGE: printf("file: path too long\n"); break;
 			}
 		pwd[strlen(pwd)] = '/';
 	}
