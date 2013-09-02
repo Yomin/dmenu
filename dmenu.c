@@ -795,7 +795,8 @@ listdir(void) {
 	DIR *dp;
 	struct dirent *ep;
 	char *maxstr = NULL;
-	char *path = *cwd ? cwd : pwd;
+	char *path = *cwd ? cwd : pwd, *ptr, *ptr2;
+	int num;
 
 	dp = opendir(path);
 	if(!dp) {
@@ -815,8 +816,25 @@ listdir(void) {
 		if(i+1 >= fsize / sizeof *fitems)
 			if(!(fitems = realloc(fitems, (fsize += BUFSIZ))))
 				eprintf("cannot realloc %u bytes:", fsize);
-		if(!(fitems[i].text = strdup(ep->d_name)))
-			eprintf("cannot strdup %u bytes:", strlen(ep->d_name)+1);
+		for(num = 0, ptr = ep->d_name; (ptr = strchr(ptr, ' ')); num++, ptr++);
+		if(!num) {
+			if(!(fitems[i].text = strdup(ep->d_name)))
+				eprintf("cannot strdup %u bytes:", strlen(ep->d_name)+1);
+		}
+		else {
+			fitems[i].text = malloc(strlen(ep->d_name)+num);
+			ptr = strtok(ep->d_name, " ");
+			ptr2 = fitems[i].text;
+			while(1) {
+				strcpy(ptr2, ptr);
+				ptr2 += strlen(ptr)+2;
+				ptr = strtok(0, " ");
+				if(ptr)
+					strcpy(ptr2-2, "\\ ");
+				else
+					break;
+			}
+		}
 		if(strlen(fitems[i].text) > max)
 			max = strlen(maxstr = fitems[i].text);
 	}
